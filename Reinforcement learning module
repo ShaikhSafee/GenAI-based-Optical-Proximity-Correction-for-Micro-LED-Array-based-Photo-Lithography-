@@ -1,0 +1,195 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import cv2
+
+# =====================================================================
+# 1. SYNTHETIC DATASET GENERATOR
+# =====================================================================
+class MEMSLayoutGenerator:
+    
+    def __init__(self, size=(64, 64)):
+        self.size = size
+
+    def generate_idt(self):
+        canvas = np.zeros(self.size, dtype=np.float32)
+        num_fingers = np.random.randint(4, 7)
+        finger_w, spacing = 2, 3
+        start_y = 10
+        for i in range(num_fingers):
+            y = start_y + i * (finger_w + spacing)
+            if y + finger_w >= self.size[1] - 10:
+                break
+            if i % 2 == 0:
+                canvas[y:y+finger_w, 10:45] = 1.0
+            else:
+                canvas[y:y+finger_w, 20:55] = 1.0
+        return canvas
+
+    def generate_cantilever(self):
+        canvas = np.zeros(self.size, dtype=np.float32)
+        canvas[10:14, 10:54] = 1.0  # Anchor bar
+        for pos in [14, 26, 38, 50]:
+            canvas[14:50, pos:pos+3] = 1.0
+            canvas[46:50, pos-1:pos+4] = 1.0  # Proof mass
+        return canvas
+
+    def build_dataset(self, num_samples=100):
+        data = []
+        for i in range(num_samples):
+            mask = self.generate_idt() if i % 2 == 0 else self.generate_cantilever()
+            data.append(mask)
+        return np.array(data, dtype=np.float32)
+
+
+class LithoDataset(Dataset):
+    def __init__(self, layouts):
+        self.layouts = torch.tensor(layouts).unsqueeze(1)  # Shape: (N, 1, H, W)
+
+    def __len__(self):
+        return len(self.layouts)
+
+    def __getitem__(self, idx):
+        return self.layouts[idx]
+
+
+# =====================================================================
+# 2. GENAI MODEL ARCHITECTURE (UNet for OPC)
+# =====================================================================
+class LithoOPCGenAI(nn.Module):
+    """Predicts pre-distorted exposure intensities to counteract diffraction."""
+    def __init__(self):
+        super(LithoOPCGenAI, self).__init__()
+        
+        # Encoder
+        self.enc1 = self._conv_block(1, 32)
+        self.enc2 = self._conv_block(32, 64)
+        self.pool = nn.MaxPool2d(2, 2)
+        
+        # Bottleneck
+        self.bottleneck = self._conv_block(64, 128)
+        
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec2 = self._conv_block(128, 64)
+        
+        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = self._conv_block(64, 32)
+        
+        self.final_layer = nn.Sequential(
+            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Sigmoid()  # Normalizes LED power output between 0.0 and 1.0
+        )
+
+    def _conv_block(self, in_c, out_c):
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_c, out_c, 3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        b = self.bottleneck(self.pool(e2))
+        
+        d2 = self.up2(b)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        
+        return self.final_layer(d1)
+
+
+# =====================================================================
+# 3. PHYSICS-INFORMED OPTICAL LOSS
+# =====================================================================
+class OpticalDiffractionLoss(nn.Module):
+    """Simulates Point Spread Function (PSF) diffraction on the wafer surface."""
+    def __init__(self, kernel_size=7, sigma=1.5):
+        super(OpticalDiffractionLoss, self).__init__()
+        x = torch.arange(-kernel_size//2 + 1., kernel_size//2 + 1.)
+        xx, yy = torch.meshgrid(x, x, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+        kernel = kernel / torch.sum(kernel)
+        
+        self.psf = kernel.view(1, 1, kernel_size, kernel_size)
+        self.mse = nn.MSELoss()
+
+    def forward(self, predistorted_pattern, target_pattern):
+        psf = self.psf.to(predistorted_pattern.device)
+        simulated_aerial_image = nn.functional.conv2d(predistorted_pattern, psf, padding=3)
+        return self.mse(simulated_aerial_image, target_pattern)
+
+
+# =====================================================================
+# 4. PIPELINE EXECUTION & EXPORT
+# =====================================================================
+def run_pipeline():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Executing GenAI Litho Engine on device: {device}")
+
+    # Step 1: Generate Data
+    gen = MEMSLayoutGenerator(size=(64, 64))
+    raw_masks = gen.build_dataset(num_samples=80)
+    dataset = LithoDataset(raw_masks)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+
+    # Step 2: Initialize Network
+    model = LithoOPCGenAI().to(device)
+    criterion = OpticalDiffractionLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    # Step 3: Train Network
+    epochs = 20
+    print("Beginning OPC Neural Network Training...")
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for batch in dataloader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            output = model(batch)
+            loss = criterion(output, batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        if (epoch + 1) % 5 == 0:
+            print(f"Epoch [{epoch+1}/{epochs}] - Loss: {total_loss / len(dataloader):.6f}")
+
+    # Step 4: Inference on Test Target
+    model.eval()
+    test_target = torch.tensor(gen.generate_cantilever()).unsqueeze(0).unsqueeze(0).to(device)
+    with torch.no_grad():
+        opc_output = model(test_target).cpu().numpy()[0, 0]
+
+    # Step 5: Export Assets for Repository & Hardware Microcontroller
+    os.makedirs("output", exist_ok=True)
+    
+    # Save Model Weights
+    torch.save(model.state_dict(), "output/opc_unet_weights.pth")
+    
+    # Save Raw Binary Stream for Micro-LED Driver (8-bit Quantized)
+    quantized_matrix = (opc_output * 255).astype(np.uint8)
+    with open("output/opc_pattern_stream.bin", "wb") as f:
+        f.write(quantized_matrix.tobytes())
+        
+    # Save Preview Visual
+    preview = np.hstack((gen.generate_cantilever() * 255, opc_output * 255)).astype(np.uint8)
+    cv2.imwrite("output/target_vs_opc_preview.png", preview)
+
+    print("Pipeline Complete! Saved weights, hardware binary stream, and visualization to /output.")
+
+
+if __name__ == "__main__":
+    run_pipeline()
