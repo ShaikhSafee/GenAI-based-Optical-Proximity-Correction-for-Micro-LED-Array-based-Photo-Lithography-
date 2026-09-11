@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+
+# ==========================================
+# 1. GenAI UNet Architecture for OPC
+# ==========================================
+class LithoOPCGenAI(nn.Module):
+    def __init__(self):
+        super(LithoOPCGenAI, self).__init__()
+        
+        # Encoder (Target Layout Analysis)
+        self.enc1 = self.conv_block(1, 32)
+        self.enc2 = self.conv_block(32, 64)
+        self.pool = nn.MaxPool2d(2, 2)
+        
+        # Bottleneck
+        self.bottleneck = self.conv_block(64, 128)
+        
+        # Decoder (Pre-distorted Intensity Map Generation)
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec2 = self.conv_block(128, 64)
+        
+        self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec1 = self.conv_block(64, 32)
+        
+        # Final intensity scaling (0.0 to 1.0 PWM values)
+        self.final_layer = nn.Sequential(
+            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Sigmoid() 
+        )
+
+    def conv_block(self, in_c, out_c):
+        return nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_c, out_c, 3, padding=1),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # Downward Pass
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        
+        # Bottleneck
+        b = self.bottleneck(self.pool(e2))
+        
+        # Upward Pass with Skip Connections
+        d2 = self.up2(b)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+        
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+        
+        return self.final_layer(d1)
+
+# ==========================================
+# 2. Physics-Informed Optical Diffraction Loss
+# ==========================================
+class OpticalDiffractionLoss(nn.Module):
+    """
+    Simulates light spreading (Point Spread Function - PSF) through
+    the reduction microscope objective to guide the generator.
+    """
+    def __init__(self, kernel_size=7, sigma=1.5):
+        super(OpticalDiffractionLoss, self).__init__()
+        # Create Gaussian PSF Kernel representing optical blur
+        x = torch.arange(-kernel_size//2 + 1., kernel_size//2 + 1.)
+        xx, yy = torch.meshgrid(x, x, indexing='ij')
+        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+        kernel = kernel / torch.sum(kernel)
+        
+        self.psf = kernel.view(1, 1, kernel_size, kernel_size)
+        self.mse = nn.MSELoss()
+
+    def forward(self, predistorted_pattern, target_pattern):
+        # Convolve predicted LED pattern with optical PSF
+        psf = self.psf.to(predistorted_pattern.device)
+        simulated_wafer_exposure = nn.functional.conv2d(predistorted_pattern, psf, padding=3)
+        
+        # Loss = difference between aerial image on wafer and ideal target layout
+        return self.mse(simulated_wafer_exposure, target_pattern)
+
+# ==========================================
+# 3. Model Pipeline Execution
+# ==========================================
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = LithoOPCGenAI().to(device)
+    criterion = OpticalDiffractionLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    # Dummy target pattern (e.g., 64x64 micro-cantilever feature mask)
+    dummy_target = torch.zeros((1, 1, 64, 64)).to(device)
+    dummy_target[:, :, 16:48, 20:44] = 1.0  # rectangular feature
+
+    # Optimization Loop
+    model.train()
+    for epoch in range(100):
+        optimizer.zero_grad()
+        output_led_intensity = model(dummy_target)
+        loss = criterion(output_led_intensity, dummy_target)
+        loss.backward()
+        optimizer.step()
+
+    # Save quantized 8-bit array for microcontroller stream
+    final_opc_matrix = (output_led_intensity.detach().cpu().numpy()[0, 0] * 255).astype(np.uint8)
+    np.save("opc_pattern_matrix.npy", final_opc_matrix)
+    print("GenAI OPC Pattern calculated and saved for Micro-LED deployment.")
